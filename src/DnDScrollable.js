@@ -1,0 +1,288 @@
+import React, { Component } from "react";
+import { findDOMNode } from "react-dom";
+import PropTypes from "prop-types";
+import throttle from "lodash.throttle";
+
+export function noop() {}
+
+export function intBetween(min, max, val) {
+  return Math.floor(Math.min(max, Math.max(min, val)));
+}
+
+export function getCoords(evt) {
+  if (evt.type === "touchmove") {
+    return {
+      x: evt.changedTouches[0].clientX,
+      y: evt.changedTouches[0].clientY
+    };
+  }
+
+  return { x: evt.clientX, y: evt.clientY };
+}
+
+const DEFAULT_BUFFER = 150;
+
+export function createHorizontalStrength(_buffer) {
+  return function defaultHorizontalStrength({ x, w, y, h }, point) {
+    const buffer = Math.min(w / 2, _buffer);
+    const inRange = point.x >= x && point.x <= x + w;
+    const inBox = inRange && point.y >= y && point.y <= y + h;
+
+    if (inBox) {
+      if (point.x < x + buffer) {
+        return (point.x - x - buffer) / buffer;
+      }
+      if (point.x > x + w - buffer) {
+        return -(x + w - point.x - buffer) / buffer;
+      }
+    }
+
+    return 0;
+  };
+}
+
+export function createVerticalStrength(_buffer) {
+  return function defaultVerticalStrength({ y, h, x, w }, point) {
+    const buffer = Math.min(h / 2, _buffer);
+    const inRange = point.y >= y && point.y <= y + h;
+    const inBox = inRange && point.x >= x && point.x <= x + w;
+
+    if (inBox) {
+      if (point.y < y + buffer) {
+        return (point.y - y - buffer) / buffer;
+      }
+      if (point.y > y + h - buffer) {
+        return -(y + h - point.y - buffer) / buffer;
+      }
+    }
+
+    return 0;
+  };
+}
+
+export const defaultHorizontalStrength = createHorizontalStrength(
+  DEFAULT_BUFFER
+);
+
+export const defaultVerticalStrength = createVerticalStrength(DEFAULT_BUFFER);
+
+export default class ScrollingComponent extends Component {
+  static propTypes = {
+    // eslint-disable-next-line react/forbid-prop-types
+    dragDropManager: PropTypes.object.isRequired,
+    onScrollChange: PropTypes.func,
+    verticalStrength: PropTypes.func,
+    horizontalStrength: PropTypes.func,
+    strengthMultiplier: PropTypes.number
+  };
+
+  static defaultProps = {
+    onScrollChange: noop,
+    verticalStrength: defaultVerticalStrength,
+    horizontalStrength: defaultHorizontalStrength,
+    strengthMultiplier: 30
+  };
+
+  // Update scaleX and scaleY every 100ms or so
+  // and start scrolling if necessary
+  updateScrolling = throttle(
+    evt => {
+      const {
+        left: x,
+        top: y,
+        width: w,
+        height: h
+      } = this.container.getBoundingClientRect();
+      const box = {
+        x,
+        y,
+        w,
+        h
+      };
+      const coords = getCoords(evt);
+
+      // calculate strength
+      const { horizontalStrength, verticalStrength } = this.props;
+      this.scaleX = horizontalStrength(box, coords);
+      this.scaleY = verticalStrength(box, coords);
+
+      // start scrolling if we need to
+      if (!this.frame && (this.scaleX || this.scaleY)) {
+        this.startScrolling();
+      }
+    },
+    100,
+    { trailing: false }
+  );
+
+  constructor(props, ctx) {
+    super(props, ctx);
+
+    this.wrappedInstance = React.createRef();
+
+    this.scaleX = 0;
+    this.scaleY = 0;
+    this.frame = null;
+
+    this.attached = false;
+    this.dragging = false;
+  }
+
+  componentDidMount() {
+    // eslint-disable-next-line react/no-find-dom-node
+    this.container = findDOMNode(this.wrappedInstance.current);
+
+    if (
+      this.container &&
+      typeof this.container.addEventListener === "function"
+    ) {
+      this.container.addEventListener("dragover", this.handleEvent);
+    }
+
+    // touchmove events don't seem to work across siblings, so we unfortunately
+    // have to attach the listeners to the body
+    window.document.body.addEventListener("touchmove", this.handleEvent);
+
+    const { dragDropManager, initialScrollTop, initialScrollLeft } = this.props;
+    this.clearMonitorSubscription = dragDropManager
+      .getMonitor()
+      .subscribeToStateChange(() => this.handleMonitorChange());
+
+    this.wrappedInstance.current.scrollTop = initialScrollTop;
+    this.wrappedInstance.current.scrollLeft = initialScrollLeft;
+  }
+
+  componentWillUnmount() {
+    if (
+      this.container &&
+      typeof this.container.removeEventListener === "function"
+    ) {
+      this.container.removeEventListener("dragover", this.handleEvent);
+    }
+
+    window.document.body.removeEventListener("touchmove", this.handleEvent);
+    this.clearMonitorSubscription();
+    this.stopScrolling();
+  }
+
+  handleEvent = evt => {
+    if (this.dragging && !this.attached) {
+      this.attach();
+      this.updateScrolling(evt);
+    }
+  };
+
+  handleMonitorChange() {
+    const { dragDropManager } = this.props;
+    const isDragging = dragDropManager.getMonitor().isDragging();
+
+    if (!this.dragging && isDragging) {
+      this.dragging = true;
+    } else if (this.dragging && !isDragging) {
+      this.dragging = false;
+      this.stopScrolling();
+    }
+  }
+
+  attach() {
+    this.attached = true;
+    window.document.body.addEventListener("dragover", this.updateScrolling);
+    window.document.body.addEventListener("touchmove", this.updateScrolling);
+  }
+
+  detach() {
+    this.attached = false;
+    window.document.body.removeEventListener("dragover", this.updateScrolling);
+    window.document.body.removeEventListener("touchmove", this.updateScrolling);
+  }
+
+  startScrolling() {
+    let i = 0;
+    const tick = () => {
+      const { scaleX, scaleY, container } = this;
+      const { strengthMultiplier, onScrollChange } = this.props;
+
+      // stop scrolling if there's nothing to do
+      if (strengthMultiplier === 0 || scaleX + scaleY === 0) {
+        this.stopScrolling();
+        return;
+      }
+
+      // there's a bug in safari where it seems like we can't get
+      // mousemove events from a container that also emits a scroll
+      // event that same frame. So we double the strengthMultiplier and only adjust
+      // the scroll position at 30fps
+      i += 1;
+      if (i % 2) {
+        const {
+          scrollLeft,
+          scrollTop,
+          scrollWidth,
+          scrollHeight,
+          clientWidth,
+          clientHeight
+        } = container;
+
+        const newLeft = scaleX
+          ? (container.scrollLeft = intBetween(
+              0,
+              scrollWidth - clientWidth,
+              scrollLeft + scaleX * strengthMultiplier
+            ))
+          : scrollLeft;
+
+        const newTop = scaleY
+          ? (container.scrollTop = intBetween(
+              0,
+              scrollHeight - clientHeight,
+              scrollTop + scaleY * strengthMultiplier
+            ))
+          : scrollTop;
+
+        onScrollChange(newLeft, newTop);
+      }
+      this.frame = requestAnimationFrame(tick);
+    };
+
+    tick();
+  }
+
+  stopScrolling() {
+    this.detach();
+    this.scaleX = 0;
+    this.scaleY = 0;
+
+    if (this.frame) {
+      cancelAnimationFrame(this.frame);
+      this.frame = null;
+    }
+  }
+
+  render() {
+    return (
+      <div
+        ref={this.wrappedInstance}
+        style={{
+          flex: "1 1 auto",
+          display: "flex",
+          alignItems: "flex-start",
+          overflowX: "auto",
+          overflowY: "scroll"
+        }}
+        onScroll={this.props.onScroll}
+      >
+        <div
+          style={{
+            minWidth: "100%",
+            flex: "0 0 auto",
+            display: "inline-flex",
+            overflow: "hidden",
+            position: "relative"
+          }}
+        >
+          {this.props.children}
+        </div>
+      </div>
+    );
+  }
+}
